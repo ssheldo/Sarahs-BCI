@@ -1,0 +1,243 @@
+
+
+
+
+%//////////////////////////////////////////////////////////////////////////
+%% Input participant's IDs and date to save the data
+Info.subjID = input('Participant Number:','s');
+Info.date = datestr(now,30); % 'dd-mmm-yyyy HH:MM:SS' 
+% Create .m file to write data in
+Filename = [Info.subjID '--' Info.date '_data.mat'];
+%//////////////////////////////////////////////////////////////////////////
+%% Get electrode information file
+% Info.electrode_locs = 'M:\Analysis\Entrainment\tACS\Vamp_18chan_montage25.ced';
+% Info.electrode_locs = 'M:\Analysis\ElectrodeLocs\EOG-electrode-locs-32.ced'; %32 channel passive electrodes
+Info.electrode_locs = 'M:\Analysis\ElectrodeLocs\EOG-electrode-locs.ced'; %18 channel active electrodes
+Info.chanlocs = readlocs(Info.electrode_locs,'filetype','autodetect');
+%//////////////////////////////////////////////////////////////////////////
+%% Get channel indices
+Info.n_elect = 1:18; %list of every electrode collecting brain data
+Info.refelec = 16; %which electrode do you want to re-reference to?
+Info.eogelec = 17:18; %list all the EOGs
+%//////////////////////////////////////////////////////////////////////////
+%% Filter the data
+Info.hicutoff = 30; %higher edge of the frequency pass band (Hz)
+Info.locutoff = 0.1; %lower edge of the frequency pass band (Hz)
+%//////////////////////////////////////////////////////////////////////////
+
+
+
+
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+% #########################################################################
+%%                        Open Data Streams
+% #########################################################################
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+% instantiate the library
+disp('Loading the library...');
+lib = lsl_loadlib();
+
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+% Resolve an EEG stream...
+disp('Resolving an EEG stream...');
+result = {};
+while isempty(result)
+    result = lsl_resolve_byprop(lib,'type','EEG'); %find the EEG stream from BrainVision RDA
+end
+%create a new EEG inlet
+disp('Opening a EEG inlet...');
+inlet_EEG = lsl_inlet(result{2});
+
+[chunk,stamps] = inlet_EEG.pull_chunk();
+
+
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+% Resolve a Marker stream...
+disp('Resolving a Markers stream...');
+result = {};
+while isempty(result)
+    result = lsl_resolve_byprop(lib,'type','Markers'); %find the marker stream from BrainVision RDA 
+end
+% create a new inlet
+disp('Opening a Marker inlet...');
+inlet_marker = lsl_inlet(result{1});
+
+[mrks,ts] = inlet_marker.pull_sample();
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+% #########################################################################
+%%                     Data Acquisition Parameters
+% #########################################################################
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+srate        = 1000;
+srate_Amp    = 1000; % sampling rate of the amplifier
+nfft         = 500;
+windowSize   = 500; % 1/2 second
+windowInc    = 500; % update every 1/2 second
+chans        = Info.n_elect; % channel streaming data from
+dataBuffer   = zeros(length(chans),(windowSize*6)/srate*srate_Amp);
+mrksBuffer   = zeros(1,(windowSize*6)/srate*srate_Amp);
+dataBufferPointer = 1;
+
+% Frequencies for spectral decomposition
+freqband = [8 12]; % alpha
+freqs     = linspace(0, srate/2, floor(nfft/2));
+freqs     = freqs(2:end); % remove DC (match the output of PSD)
+freqRange = intersect(find(freqs >= freqband(1)), find(freqs <= freqband(2)));
+
+% Create filter
+freqfilt = [7 8 14 15];
+B = design_bandpass(freqfilt,srate_Amp,20,true);
+
+% Selects electrode for feedback
+mask = zeros(length(chans),1)';
+mask(7) = 1; %Pz
+
+
+
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+% #########################################################################
+%%                    Deal with Incoming EEG Data
+% #########################################################################
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+% Fill the EEG data structure (for eeglab)
+EEG          = eeg_emptyset; 
+EEG.nbchan   = length(chans);
+EEG.srate    = srate;
+EEG.xmin     = 0;
+EEG.chanlocs = Info.chanlocs;
+
+state = []; %for use with BCILab functions 
+
+winPerSec = windowSize/windowInc;
+chunkSize = windowInc*srate_Amp/srate; % at 512 so every 1/4 second is 128 samples
+
+% 1 minute of data for baseline
+sessionDuration = 60; % 1 minute
+dataAccu = zeros(length(chans), (sessionDuration+3)*srate);    
+dataAccuPointer = 1;  
+
+% Save processed data
+chunkPower    = zeros(1, sessionDuration*10);
+chunkPower2   = {};
+chunkPower3   = zeros(3, sessionDuration*10);
+pxx           = {};
+f             = {};
+
+chunkCount = 1; % Keep track of number of data chunks
+
+tic; % start timer
+
+%% ========================================================================
+                        %%%%%%%%%%%%%%%%%%%%%%
+                        % Neurofeedback loop %
+                        %%%%%%%%%%%%%%%%%%%%%%
+% =========================================================================
+
+while toc < sessionDuration
+    
+    % Get chunk from the EEG inlet
+    [chunk,stamps] = inlet_EEG.pull_chunk();
+    
+    % Get data from the marker inlet
+%     [mrks,ts] = inlet_marker.pull_sample();
+% %     and display it
+%     fprintf('got %s at time %.5f\n',mrks{1},ts);
+    
+    
+    % Fill buffer
+    if ~isempty(chunk) && size(chunk,2) > 1
+        
+        if dataBufferPointer + size(chunk,2) > size(dataBuffer,2)
+            disp('Buffer overrun');
+            dataBuffer(:,dataBufferPointer:end) = chunk(chans,1:(size(dataBuffer,2)-dataBufferPointer+1));
+            dataBufferPointer = size(dataBuffer,2);
+        else
+            dataBuffer(:,dataBufferPointer:dataBufferPointer+size(chunk,2)-1) = chunk(chans,:);
+%             mrksBuffer(1,dataBufferPointer:dataBufferPointer+size(mrks,2)-1) = mrks(:);
+            dataBufferPointer = dataBufferPointer+size(chunk,2);
+        end
+        
+    end
+    
+    
+    % Fill EEG.data
+    if dataBufferPointer > chunkSize*winPerSec
+        
+        % empty buffer based on specified sample rate
+        if srate_Amp == srate
+                EEG.data = dataBuffer(:,1:chunkSize*winPerSec);   
+%                 EEG.mrks = mrksBuffer(1,1:chunkSize*winPerSec);
+            elseif srate_Amp == 2*srate
+                EEG.data = dataBuffer(:,1:2:chunkSize*winPerSec);
+            elseif srate_Amp == 4*srate
+                EEG.data = dataBuffer(:,1:4:chunkSize*winPerSec);
+            elseif srate_Amp == 8*srate
+                EEG.data = dataBuffer(:,1:8:chunkSize*winPerSec);
+        else
+            error('Cannot convert sampling rate')
+        end
+        
+        % Shift buffer 1 block
+        dataBuffer(:,1:chunkSize*(winPerSec-1)) = dataBuffer(:,chunkSize+1:chunkSize*winPerSec);
+        dataBufferPointer = dataBufferPointer-chunkSize;
+        
+        % !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        % Processing Streaming Data
+        % !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        
+        % Arithmetically rereference to linked mastoid (M1 + M2)/2
+        for x = 1:size(EEG.data,1)-2 % excluding EOGs
+            EEG.data(x,:) = (EEG.data(x,:)-((EEG.data(Info.refelec,:))*.5));
+        end
+
+        % Correct for EOG artifacts
+        EEG = online_filt_EOG(EEG);
+        
+        % Update EEG information
+        EEG.pnts = size(EEG.data,2);
+        EEG.nchan = size(EEG.data,1);
+        EEG.xmax = EEG.pnts/EEG.srate;
+        
+        % Filter data
+%         [EEG state] = exp_eval(flt_fir('signal',EEG,'fspec',[0.5 1],'fmode','highpass','ftype','minimum-phase','state',state));
+        
+        if toc > 1
+            dataAccu(:, dataAccuPointer:dataAccuPointer+size(EEG.data)-1) = EEG.data;
+            dataAccuPointer = dataAccuPointer + size(EEG.data);
+        end
+       
+        
+        chunkCount = chunkCount + 1; %keep track of number of data chunks
+        
+    end %data buffer
+    
+end
+
+
+% #########################################################################
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+%%                           ASR Calibration
+% #########################################################################
+% ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+disp('Training ASR, please wait...');
+Info.stateAsr = asr_calibrate(dataAccu(:, 1:EEG.srate*60), EEG.srate);
+
+
+% Creating new folders if they don't exist 
+if ~exist(['M:\Experiments\BCI\SubjData\' Info.subjID '\'],'dir')
+    mkdir(['M:\Experiments\BCI\SubjData\' Info.subjID '\']);
+end
+    
+% Save data
+asrFileName = fullfile(['M:\Experiments\BCI\SubjData\' Info.subjID], [date '_baseline_ASR_state.mat']);
+save(asrFileName,'Info')
+
+
+
